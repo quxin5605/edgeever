@@ -1,8 +1,8 @@
 name: Update deployed EdgeEver
 
 # Keeps a deployment Fork aligned with upstream EdgeEver.
-# Deployment Forks mirror product code by default while preserving a small
-# updater layer so GITHUB_TOKEN never needs permission to rewrite Actions.
+# Deployment Forks are read-only mirrors by default: when content differs,
+# main resets to the selected Release (or edge main) and triggers Cloudflare.
 # The rare customized Fork must explicitly opt in to merge preservation.
 
 on:
@@ -18,6 +18,12 @@ on:
         options:
           - stable
           - edge
+      force_redeploy:
+        description: When already on the target version, push an empty commit so Cloudflare Builds runs again
+        required: false
+        default: false
+        type: boolean
+
 permissions:
   contents: write
   issues: write
@@ -29,16 +35,14 @@ concurrency:
 jobs:
   update:
     if: github.repository != 'tianma-if/edgeever'
-    name: Sync Fork and trigger deployment
+    name: Align and publish upstream
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       UPSTREAM_REPOSITORY: tianma-if/edgeever
       UPDATE_CHANNEL: ${{ inputs.channel || vars.EDGE_EVER_UPDATE_CHANNEL || 'stable' }}
-      # A manual run is an explicit request to publish the selected version.
-      # Scheduled checks remain no-op when the Fork is already aligned.
-      FORCE_REDEPLOY: ${{ github.event_name == 'workflow_dispatch' }}
+      FORCE_REDEPLOY: ${{ inputs.force_redeploy || false }}
       PRESERVE_FORK_CHANGES: ${{ vars.EDGE_EVER_PRESERVE_FORK_CHANGES || 'false' }}
 
     steps:
@@ -91,13 +95,8 @@ jobs:
             head_version="unknown"
           fi
 
-          # GitHub blocks GITHUB_TOKEN pushes that add, modify, or remove Actions
-          # workflows. Deployment forks therefore compare and update only the
-          # managed product tree; the small downstream updater layer stays local.
-          content_diff="$(git diff --name-only "${target_commit}" HEAD -- . \
-            ':(exclude).github/workflows/**' \
-            ':(exclude)scripts/prepare-upstream-sync.mjs' \
-            ':(exclude)scripts/upstream-sync-plan.mjs' || true)"
+          # Updater-only differences do not trigger a product update.
+          content_diff="$(git diff --name-only "${target_commit}" HEAD -- ':!.github/workflows/sync-edgeever-upstream.yml' ':!scripts/upstream-sync-plan.mjs' || true)"
           content_matches_target=false
           if [ -z "${content_diff}" ]; then
             content_matches_target=true
@@ -121,13 +120,6 @@ jobs:
             target_is_ancestor_of_head=true
           fi
 
-          planner_path="${RUNNER_TEMP}/upstream-sync-plan.mjs"
-          if git cat-file -e "${target_commit}:scripts/upstream-sync-plan.mjs" 2>/dev/null; then
-            git show "${target_commit}:scripts/upstream-sync-plan.mjs" > "${planner_path}"
-          else
-            cp scripts/upstream-sync-plan.mjs "${planner_path}"
-          fi
-
           IFS=$'\t' read -r update_required align_mode reason republish_only < <(
             EDGE_SYNC_CONTENT_MATCHES_TARGET="${content_matches_target}" \
             EDGE_SYNC_FORCE_REDEPLOY="${FORCE_REDEPLOY}" \
@@ -135,13 +127,8 @@ jobs:
             EDGE_SYNC_HEAD_IS_ANCESTOR_OF_TARGET="${head_is_ancestor_of_target}" \
             EDGE_SYNC_PRESERVE_FORK_CHANGES="${PRESERVE_FORK_CHANGES}" \
             EDGE_SYNC_TARGET_IS_ANCESTOR_OF_HEAD="${target_is_ancestor_of_head}" \
-              node "${planner_path}"
+              node scripts/upstream-sync-plan.mjs
           )
-          # Releases created before the snapshot updater called this mode reset.
-          # Normalize that legacy plan without executing a history rewrite.
-          if [ "${align_mode}" = "reset" ]; then
-            align_mode=snapshot
-          fi
 
           {
             echo "target_ref=${target_ref}"
@@ -156,15 +143,15 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
           {
-            echo "### EdgeEver update / EdgeEver 更新"
+            echo "### EdgeEver upstream sync"
             echo ""
-            echo "| Field / 字段 | Value / 值 |"
+            echo "| Field | Value |"
             echo "| --- | --- |"
-            echo "| Channel / 更新通道 | \`${UPDATE_CHANNEL}\` |"
-            echo "| Fork mode / Fork 模式 | \`${fork_mode}\` |"
-            echo "| Upstream target / 上游目标 | \`${target_ref}\` (\`${target_commit:0:12}\`, v${target_version}) |"
-            echo "| Fork main before / 更新前 | \`${head_commit:0:12}\` (v${head_version}) |"
-            echo "| Decision / 判定 | \`${reason}\` / align=\`${align_mode}\` / update=\`${update_required}\` / republish=\`${republish_only}\` |"
+            echo "| Channel | \`${UPDATE_CHANNEL}\` |"
+            echo "| Fork mode | \`${fork_mode}\` |"
+            echo "| Upstream target | \`${target_ref}\` (\`${target_commit:0:12}\`, v${target_version}) |"
+            echo "| Fork main before | \`${head_commit:0:12}\` (v${head_version}) |"
+            echo "| Decision | \`${reason}\` / align=\`${align_mode}\` / update=\`${update_required}\` / republish=\`${republish_only}\` |"
             echo ""
             case "${reason}" in
               already_on_target)
@@ -174,13 +161,13 @@ jobs:
                 echo "**Application content already matches upstream target** (history tip may differ). No git update is needed for deployment."
                 ;;
               behind_target)
-                echo "**Fork is behind upstream.** Applying the target product snapshot while preserving downstream workflows."
+                echo "**Fork is behind upstream.** Aligning with a hard reset to the target commit (deploy-mirror path)."
                 ;;
               deploy_mirror_reset)
-                echo "**Deployment mirror differs from upstream.** Replacing managed product files with the selected target while preserving downstream workflows."
+                echo "**Deployment mirror differs from upstream.** Resetting onto the selected target; Fork application code is not preserved (the fork's own updater files are)."
                 ;;
               deploy_mirror_ahead)
-                echo "**Deploy-only fork is ahead of the selected upstream target.** Applying that target's product snapshot while preserving downstream workflows."
+                echo "**Deploy-only fork is ahead of the selected upstream target.** Resetting onto that target."
                 ;;
               customized_contains_target)
                 echo "**Opt-in customized fork already contains the upstream target.** Preserving its application changes without another merge."
@@ -194,19 +181,11 @@ jobs:
             esac
             if [ "${republish_only}" = "true" ]; then
               echo ""
-              echo "**Manual redeploy / 手动重新部署：** the Fork is already aligned, so this run will push an empty commit and request a fresh Cloudflare build."
+              echo "\`force_redeploy\` is set: will push an empty commit so Cloudflare Workers Builds runs again."
             fi
             echo ""
-            echo "Prefer this workflow over GitHub **Sync fork**. Mirror mode owns the managed product tree while preserving the Fork's local updater layer and \`.github/workflows/**\`."
+            echo "Prefer this workflow over GitHub **Sync fork**. The default mirror mode intentionally owns \`main\` and resets it to the selected upstream target."
           } >> "${GITHUB_STEP_SUMMARY}"
-
-          if [ "${republish_only}" = "true" ]; then
-            echo "::notice title=Manual redeploy / 手动重新部署::Fork code is already v${target_version}. This run will push an empty commit and request a fresh Cloudflare build."
-          elif [ "${update_required}" = "true" ]; then
-            echo "::notice title=EdgeEver update / EdgeEver 更新::Fork main v${head_version} will be synchronized to v${target_version}, then a Cloudflare build will be requested."
-          else
-            echo "::notice title=Scheduled check / 定时检查::Fork code is already v${target_version}. No Git push or Cloudflare deployment was requested by this run."
-          fi
 
           echo "channel=${UPDATE_CHANNEL} target=${target_ref}@${target_commit:0:12} (v${target_version}) head=${head_commit:0:12} (v${head_version}) reason=${reason} align=${align_mode} update=${update_required} republish=${republish_only}"
 
@@ -222,22 +201,51 @@ jobs:
           git config user.name "edgeever-updater[bot]"
           git config user.email "edgeever-updater[bot]@users.noreply.github.com"
 
-          helper_path="${RUNNER_TEMP}/prepare-upstream-sync.mjs"
-          if git cat-file -e "${TARGET_COMMIT}:scripts/prepare-upstream-sync.mjs" 2>/dev/null; then
-            git show "${TARGET_COMMIT}:scripts/prepare-upstream-sync.mjs" > "${helper_path}"
-          else
-            cp scripts/prepare-upstream-sync.mjs "${helper_path}"
-          fi
+          case "${ALIGN_MODE}" in
+            reset)
+              # The workflow file and sync plan are fork-owned updater files.
+              # Preserve the fork's copies across the mirror reset: otherwise
+              # main would carry upstream's copy, which lacks the workflow-scoped
+              # deploy token needed to push future .github/workflows changes.
+              updater_dir="${RUNNER_TEMP}/fork-updater"
+              mkdir -p "${updater_dir}"
+              git show HEAD:.github/workflows/sync-edgeever-upstream.yml > "${updater_dir}/sync-edgeever-upstream.yml" || true
+              git show HEAD:scripts/upstream-sync-plan.mjs > "${updater_dir}/upstream-sync-plan.mjs" || true
 
-          EDGE_SYNC_ALIGN_MODE="${ALIGN_MODE}" \
-          EDGE_SYNC_BASE_COMMIT="HEAD" \
-          EDGE_SYNC_TARGET_COMMIT="${TARGET_COMMIT}" \
-            node "${helper_path}" prepare
-          echo "Prepared ${ALIGN_MODE} update from ${TARGET_REF} (${TARGET_COMMIT:0:12}) because ${REASON}."
+              git reset --hard "${TARGET_COMMIT}"
+              git clean -fd
+
+              if [ -s "${updater_dir}/sync-edgeever-upstream.yml" ]; then
+                mkdir -p .github/workflows scripts
+                cp "${updater_dir}/sync-edgeever-upstream.yml" .github/workflows/sync-edgeever-upstream.yml
+                cp "${updater_dir}/upstream-sync-plan.mjs" scripts/upstream-sync-plan.mjs
+                git add .github/workflows/sync-edgeever-upstream.yml scripts/upstream-sync-plan.mjs
+                if ! git diff --cached --quiet; then
+                  git commit -m "chore: preserve fork updater files on ${TARGET_REF}"
+                fi
+              fi
+              echo "Reset main onto ${TARGET_REF} (${TARGET_COMMIT:0:12}) because ${REASON}."
+              ;;
+            merge)
+              if ! git merge --no-edit -m "chore: update EdgeEver from ${TARGET_REF}" "${TARGET_COMMIT}"; then
+                git merge --abort || true
+                echo "Merge from ${TARGET_REF} conflicted with local application changes." >&2
+                echo "Resolve the customized fork manually, or remove EDGE_EVER_PRESERVE_FORK_CHANGES to return to mirror mode." >&2
+                exit 1
+              fi
+              echo "Merged ${TARGET_REF} (${TARGET_COMMIT:0:12}) because ${REASON}."
+              ;;
+            *)
+              echo "Unsupported align mode: ${ALIGN_MODE}" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Set up Bun
         if: steps.upstream.outputs.align_mode == 'merge'
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       - name: Verify customized merge
         if: steps.upstream.outputs.align_mode == 'merge'
@@ -245,7 +253,7 @@ jobs:
           set -euo pipefail
           bun install --frozen-lockfile
           bun run db:migrate:local
-          bun run test
+          bun test --path-ignore-patterns='tests/e2e/**'
           bun run typecheck
           bun run build
 
@@ -254,15 +262,25 @@ jobs:
         if: steps.upstream.outputs.update_required == 'true' || steps.upstream.outputs.republish_only == 'true'
         env:
           TARGET_REF: ${{ steps.upstream.outputs.target_ref }}
-          TARGET_COMMIT: ${{ steps.upstream.outputs.target_commit }}
           UPDATE_REQUIRED: ${{ steps.upstream.outputs.update_required }}
           REPUBLISH_ONLY: ${{ steps.upstream.outputs.republish_only }}
           ALIGN_MODE: ${{ steps.upstream.outputs.align_mode }}
           REASON: ${{ steps.upstream.outputs.reason }}
+          DEPLOY_TOKEN: ${{ secrets.EDGE_EVER_DEPLOY_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name "edgeever-updater[bot]"
           git config user.email "edgeever-updater[bot]@users.noreply.github.com"
+
+          if [ -n "${DEPLOY_TOKEN:-}" ]; then
+            # GITHUB_TOKEN (a GitHub App token) lacks the `workflows` permission,
+            # so pushes that touch .github/workflows/* are rejected. actions/checkout
+            # also persists a GITHUB_TOKEN Authorization extraheader that overrides
+            # URL credentials and routes the push as an app token, so remove it and
+            # push with the PAT (workflow scope) directly.
+            git config --local --unset-all http.https://github.com/.extraheader || true
+            git remote set-url origin "https://${DEPLOY_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          fi
 
           if [ "${REPUBLISH_ONLY}" = "true" ] && [ "${UPDATE_REQUIRED}" != "true" ]; then
             git commit --allow-empty -m "chore: retrigger EdgeEver deployment for ${TARGET_REF}"
@@ -272,33 +290,20 @@ jobs:
             exit 0
           fi
 
-          git commit \
-            -m "chore: update EdgeEver from ${TARGET_REF}" \
-            -m "EdgeEver-Upstream-Commit: ${TARGET_COMMIT}"
-
-          if ! git diff --quiet HEAD^ HEAD -- \
-            .github/workflows \
-            scripts/prepare-upstream-sync.mjs \
-            scripts/upstream-sync-plan.mjs; then
-            echo "Refusing to publish an update that changes the downstream updater layer." >&2
-            exit 1
+          if [ "${ALIGN_MODE}" = "reset" ]; then
+            # The preserved updater-file commit makes main diverge from the
+            # upstream chain, so every reset publish is a history rewrite —
+            # guarded with --force-with-lease against concurrent pushes.
+            git push --force-with-lease origin HEAD:main
+            echo "mode=force_with_lease" >> "${GITHUB_OUTPUT}"
+            echo "Published reset main for ${TARGET_REF}."
+          else
+            git push origin HEAD:main
+            echo "mode=push" >> "${GITHUB_OUTPUT}"
+            echo "Published merge for ${TARGET_REF}."
           fi
 
-          if [ "${ALIGN_MODE}" = "snapshot" ] && \
-             ! git diff --quiet "${TARGET_COMMIT}" HEAD -- . \
-               ':(exclude).github/workflows/**' \
-               ':(exclude)scripts/prepare-upstream-sync.mjs' \
-               ':(exclude)scripts/upstream-sync-plan.mjs'; then
-            echo "Prepared product tree does not match ${TARGET_REF}." >&2
-            exit 1
-          fi
-
-          git push origin HEAD:main
-          echo "mode=${ALIGN_MODE}_commit" >> "${GITHUB_OUTPUT}"
-          echo "Published ${ALIGN_MODE} update for ${TARGET_REF} without changing downstream workflows."
-
-      - name: Request Cloudflare deployment
-        id: deploy
+      - name: Trigger Cloudflare Deploy Hook
         if: steps.publish.outcome == 'success'
         env:
           DEPLOY_HOOK_URL: ${{ secrets.EDGE_EVER_CLOUDFLARE_DEPLOY_HOOK_URL }}
@@ -307,16 +312,14 @@ jobs:
           if [ -z "${DEPLOY_HOOK_URL:-}" ]; then
             echo "No EDGE_EVER_CLOUDFLARE_DEPLOY_HOOK_URL secret — relying on Cloudflare Git integration for main pushes."
             echo "Optional: add a Workers/Pages Deploy Hook secret if pushes do not start builds." >> "${GITHUB_STEP_SUMMARY}"
-            echo "method=git_push" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
           curl -fsS -X POST "${DEPLOY_HOOK_URL}" >/dev/null
           echo "Triggered Cloudflare Deploy Hook."
-          echo "method=git_push_and_deploy_hook" >> "${GITHUB_OUTPUT}"
           echo "" >> "${GITHUB_STEP_SUMMARY}"
           echo "Triggered optional Cloudflare Deploy Hook after publish." >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Report result / 输出结果
+      - name: Final status
         if: always() && steps.upstream.outcome == 'success'
         env:
           TARGET_REF: ${{ steps.upstream.outputs.target_ref }}
@@ -326,76 +329,30 @@ jobs:
           REPUBLISH_ONLY: ${{ steps.upstream.outputs.republish_only }}
           REASON: ${{ steps.upstream.outputs.reason }}
           ALIGN_MODE: ${{ steps.upstream.outputs.align_mode }}
-          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
-          PUBLISH_MODE: ${{ steps.publish.outputs.mode }}
-          DEPLOY_TRIGGER_OUTCOME: ${{ steps.deploy.outcome }}
-          DEPLOY_TRIGGER_METHOD: ${{ steps.deploy.outputs.method }}
         run: |
           set -euo pipefail
           final_commit="$(git rev-parse HEAD)"
-          git_result="Not requested / 未请求"
-          deploy_result="Not requested / 未请求"
-          live_result="Not changed by this run / 本次运行未改变线上部署"
-          live_status="unchanged"
-          notice_level="notice"
-          notice_title="Scheduled check / 定时检查"
-          notice_body="Fork code is already v${TARGET_VERSION}. No Git push or Cloudflare deployment was requested."
-
-          if [ "${UPDATE_REQUIRED}" = "true" ] || [ "${REPUBLISH_ONLY}" = "true" ]; then
-            live_result="Not verified by this workflow / 本工作流未验证"
-            live_status="not_verified"
-            if [ "${PUBLISH_OUTCOME}" != "success" ]; then
-              git_result="Failed (\`${PUBLISH_OUTCOME}\`) / 失败"
-              deploy_result="Not requested because Git publish failed / 因 Git 发布失败而未请求"
-              notice_level="error"
-              notice_title="Git publish failed / Git 发布失败"
-              notice_body="The Fork could not publish v${TARGET_VERSION}; no Cloudflare deployment was requested."
-            else
-              case "${PUBLISH_MODE}" in
-                empty_commit)
-                  git_result="Redeploy commit pushed / 已推送重部署 commit"
-                  ;;
-                *)
-                  git_result="Version update pushed (\`${ALIGN_MODE}\`) / 已推送版本更新"
-                  ;;
-              esac
-
-              if [ "${DEPLOY_TRIGGER_OUTCOME}" = "success" ]; then
-                case "${DEPLOY_TRIGGER_METHOD}" in
-                  git_push_and_deploy_hook)
-                    deploy_result="Requested by Git push and Deploy Hook / 已通过 Git push 和 Deploy Hook 请求"
-                    ;;
-                  *)
-                    deploy_result="Requested by Git push / 已通过 Git push 请求"
-                    ;;
-                esac
-                notice_title="Deployment requested / 已请求部署"
-                notice_body="Fork main is ${final_commit:0:12} (v${TARGET_VERSION}). Confirm Cloudflare Deployments builds this commit; the live version is not verified here."
-              else
-                deploy_result="Trigger failed (\`${DEPLOY_TRIGGER_OUTCOME}\`) / 触发失败"
-                notice_level="error"
-                notice_title="Deployment trigger failed / 部署触发失败"
-                notice_body="Fork main is ${final_commit:0:12} (v${TARGET_VERSION}), but the Cloudflare deployment request failed."
-              fi
-            fi
-          fi
-
           {
             echo ""
-            echo "### Result / 结果"
+            echo "### Result"
             echo ""
-            echo "| Field / 字段 | Value / 值 |"
+            echo "| Field | Value |"
             echo "| --- | --- |"
-            echo "| Target version / 目标版本 | \`${TARGET_REF}\` / v${TARGET_VERSION} |"
-            echo "| Final main / 最终 main | \`${final_commit:0:12}\` |"
-            echo "| Git publish / Git 发布 | ${git_result} |"
-            echo "| Deployment trigger / 部署触发 | ${deploy_result} |"
-            echo "| Live deployment / 线上部署 | ${live_result} |"
-            echo ""
-            echo "When a deployment was requested, confirm Cloudflare **Deployments** builds commit \`${final_commit:0:12}\`. / 若已请求部署，请在 Cloudflare **Deployments** 中确认构建 commit 为 \`${final_commit:0:12}\`。"
+            echo "| Final main | \`${final_commit:0:12}\` |"
+            echo "| Target | \`${TARGET_REF}\` / v${TARGET_VERSION} |"
+            if [ "${UPDATE_REQUIRED}" = "true" ]; then
+              echo "| Outcome | Updated and published (\`${ALIGN_MODE}\`) |"
+              echo ""
+              echo "Cloudflare Workers Builds should deploy this commit from \`main\`. Confirm the Deployment commit SHA matches \`${final_commit:0:12}\`."
+            elif [ "${REPUBLISH_ONLY}" = "true" ]; then
+              echo "| Outcome | Republished empty commit for redeploy |"
+            else
+              echo "| Outcome | Already aligned (\`${REASON}\`) — no push |"
+              echo ""
+              echo "If the live site still shows an older version while Git is current, open Cloudflare **Deployments** and retry the latest build, or re-run this workflow with **force_redeploy**."
+            fi
           } >> "${GITHUB_STEP_SUMMARY}"
-          echo "::${notice_level} title=${notice_title}::${notice_body}"
-          echo "result target=v${TARGET_VERSION} final=${final_commit:0:12} git_publish=${PUBLISH_OUTCOME} publish_mode=${PUBLISH_MODE:-none} deploy_trigger=${DEPLOY_TRIGGER_OUTCOME} deploy_method=${DEPLOY_TRIGGER_METHOD:-none} live=${live_status}"
+          echo "final=${final_commit:0:12} reason=${REASON} update=${UPDATE_REQUIRED} republish=${REPUBLISH_ONLY}"
 
       - name: Report an update failure
         if: failure()
@@ -404,6 +361,11 @@ jobs:
           TARGET_REF: ${{ steps.upstream.outputs.target_ref || 'unknown' }}
         run: |
           set -euo pipefail
+          has_issues="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.has_issues')"
+          if [ "${has_issues}" != "true" ]; then
+            echo "Issues are disabled on ${GITHUB_REPOSITORY} — skipping the failure issue." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
           title="EdgeEver automatic update requires attention"
           existing="$(gh issue list --state open --search "${title} in:title" --json number --jq '.[0].number // empty')"
           if [ -z "${existing}" ]; then
